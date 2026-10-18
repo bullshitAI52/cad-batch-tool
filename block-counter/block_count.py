@@ -1,0 +1,196 @@
+"""Read-only block quantity reporting; DWG input needs ODA, DXF does not."""
+import argparse
+from collections import defaultdict
+import csv
+from datetime import datetime
+import os
+from pathlib import Path
+import sys
+import uuid
+
+import ezdxf
+from ezdxf.addons import odafc
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+HEADERS = ['文件路径', '空间/布局', '有效图层', '原始块名', '类别', '直接数量', '嵌套数量']
+STATUS_HEADERS = ['文件路径', '状态', '说明']
+NOTE = '直接数量=布局中的块实例；嵌套数量=块内部引用乘以父级实例数。父块与子块不要相加作为设备总数。'
+
+
+def configure_oda(path=None):
+    if path:
+        executable = Path(path).expanduser().resolve()
+        if not executable.is_file():
+            raise FileNotFoundError(f'ODA 程序不存在：{executable}')
+        option = 'win_exec_path' if os.name == 'nt' else 'unix_exec_path'
+        ezdxf.options.set('odafc-addon', option, str(executable))
+    elif os.name == 'nt' and not odafc.is_installed():
+        base = Path(os.environ.get('ProgramFiles', r'C:\Program Files')) / 'ODA'
+        matches = sorted(base.glob('**/ODAFileConverter.exe'))
+        if matches:
+            ezdxf.options.set('odafc-addon', 'win_exec_path', str(matches[-1]))
+
+
+def count_blocks(doc, source, scope='all', nested=True, max_depth=32, max_visits=100000):
+    counts = defaultdict(lambda: [0, 0])
+    notices = set()
+    visits = 0
+    truncated = False
+
+    def walk(ref, layout, parent_layer, multiplier, chain):
+        nonlocal visits, truncated
+        if visits >= max_visits:
+            truncated = True
+            notices.add('达到安全遍历上限，数量不完整')
+            return
+        visits += 1
+        name = ref.dxf.name
+        identity = name.casefold()
+        if identity in chain:
+            notices.add(f'检测到循环块引用，已停止该分支：{name}')
+            return
+        if len(chain) > max_depth:
+            notices.add('超过嵌套深度上限，深层数量未统计')
+            return
+        block = ref.block()
+        category = '普通块'
+        if block is None:
+            category = '缺失定义'
+            notices.add(f'找不到块定义：{name}')
+        elif block.block.dxf.flags & 12:
+            category = '外部参照'
+            notices.add('外部参照只统计引用次数，不读取外部图纸内容')
+        elif name.startswith('*'):
+            category = '匿名/可能为动态块'
+            notices.add('匿名/动态块保留原始名称，未合并为有效块名')
+        layer = ref.dxf.get('layer', '0')
+        if layer == '0' and chain:
+            layer = parent_layer
+        # Match ezdxf multi_insert(): zero-spacing rows/columns occupy one location.
+        quantity = multiplier * max(1, int(ref.mcount))
+        key = (str(source), layout, layer, name, category)
+        counts[key][1 if chain else 0] += quantity
+        if nested and block is not None and category != '外部参照':
+            for child in block.query('INSERT'):
+                if truncated:
+                    break
+                walk(child, layout, layer, quantity, chain + (identity,))
+
+    layouts = [doc.modelspace()] if scope == 'model' else list(doc.layouts)
+    for layout in layouts:
+        for ref in layout.query('INSERT'):
+            if truncated:
+                break
+            walk(ref, layout.name, '0', 1, ())
+    rows = [list(key) + values for key, values in sorted(counts.items())]
+    return rows, sorted(notices)
+
+
+def load_drawing(path):
+    if path.suffix.lower() == '.dxf':
+        return ezdxf.readfile(path)
+    if path.suffix.lower() == '.dwg':
+        if not odafc.is_installed():
+            raise RuntimeError('DWG 需要安装 ODA File Converter；也可先用 DXF 文件')
+        return odafc.readfile(path, version='R2018', audit=False)
+    raise ValueError('仅支持 .dwg 和 .dxf 文件')
+
+
+def safe_csv(value):
+    # Prevent drawing names/text being evaluated as spreadsheet formulas.
+    if isinstance(value, str) and value.lstrip().startswith(('=', '+', '-', '@')):
+        return "'" + value
+    return value
+
+
+def write_sheet(ws, headers, rows, note, widths):
+    ws.append([note])
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    ws.row_dimensions[1].height = 45
+    ws.cell(1, 1).alignment = Alignment(wrap_text=True, vertical='center')
+    ws.append(headers)
+    for row in rows:
+        ws.append(row)
+    for row in ws.iter_rows():
+        for cell in row:
+            if isinstance(cell.value, str):
+                cell.data_type = 's'
+            if cell.row > 2:
+                cell.alignment = Alignment(vertical='top', wrap_text=True)
+                if isinstance(cell.value, int):
+                    cell.number_format = '#,##0'
+    for cell in ws[2]:
+        cell.fill = PatternFill('solid', fgColor='234666')
+        cell.font = Font(color='FFFFFF', bold=True)
+    for i, width in enumerate(widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+    ws.freeze_panes = 'D3'
+    ws.auto_filter.ref = f'A2:{get_column_letter(len(headers))}{max(2,ws.max_row)}'
+
+
+def export_reports(rows, statuses, output_dir, scope, nested):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    base = output_dir / ('块数量统计_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:8])
+    xlsx, csv_path, status_csv = [Path(str(base) + ext) for ext in ('.xlsx', '.csv', '_处理记录.csv')]
+    wb = Workbook()
+    detail = wb.active
+    detail.title = '块数量统计'
+    note = NOTE + f' 范围：{scope}；嵌套统计：{nested}；包括隐藏/关闭/冻结图层。'
+    write_sheet(detail, HEADERS, rows, note, [46, 22, 24, 32, 24, 16, 16])
+    write_sheet(wb.create_sheet('处理记录'), STATUS_HEADERS, statuses,
+                '检查失败及警告：失败图纸不计入统计；警告可能表示统计不完整。', [55, 18, 95])
+    wb.save(xlsx)
+    for path, headers, content in [(csv_path, HEADERS, rows), (status_csv, STATUS_HEADERS, statuses)]:
+        with path.open('w', encoding='utf-8-sig', newline='') as stream:
+            writer = csv.writer(stream)
+            writer.writerow(headers)
+            writer.writerows([safe_csv(v) for v in row] for row in content)
+    return xlsx, csv_path, status_csv
+
+
+def main():
+    parser = argparse.ArgumentParser(description='只读统计 CAD 块数量，导出 Excel 和 CSV；无需 AutoCAD')
+    parser.add_argument('files', nargs='*')
+    parser.add_argument('--output-dir', type=Path)
+    parser.add_argument('--oda-path', default=os.environ.get('ODA_FILE_CONVERTER'))
+    parser.add_argument('--scope', choices=['all', 'model'], default='all')
+    parser.add_argument('--no-nested', action='store_true')
+    args = parser.parse_args()
+    if not args.files:
+        import tkinter as tk
+        from tkinter.filedialog import askopenfilenames
+        root = tk.Tk()
+        root.withdraw()
+        args.files = askopenfilenames(title='选择要统计的图纸（可多选）', filetypes=[('CAD', '*.dwg *.dxf')])
+        root.destroy()
+        if not args.files:
+            return 0
+    configure_oda(args.oda_path)
+    rows, statuses = [], []
+    seen = set()
+    for filename in args.files:
+        path = Path(filename).expanduser().resolve()
+        if path in seen:
+            continue
+        seen.add(path)
+        print(f'统计：{path.name}', flush=True)
+        try:
+            doc = load_drawing(path)
+            items, notices = count_blocks(doc, path, args.scope, not args.no_nested)
+            rows.extend(items)
+            if notices:
+                statuses.extend([[str(path), '警告', n] for n in notices])
+            else:
+                statuses.append([str(path), '成功', '已统计' if items else '未发现 INSERT 块引用（数量为零）'])
+        except Exception as exc:
+            statuses.append([str(path), '失败', str(exc)])
+    output_dir = args.output_dir or Path(args.files[0]).resolve().parent / '块统计结果'
+    for path in export_reports(rows, statuses, output_dir, args.scope, not args.no_nested):
+        print('已生成：', path)
+    return 1 if any(row[1] == '失败' for row in statuses) else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
