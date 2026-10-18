@@ -1,0 +1,6 @@
+*.dwg
+*.bak
+*.dwl
+*.dwl2
+*.log
+.DS_Store
