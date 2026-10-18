@@ -163,6 +163,60 @@ def export_reports(rows, statuses, output_dir, scope, nested, dedup=None, overla
     return (xlsx, csv_path, status_csv, *(item[0] for item in extra))
 
 
+def run_batch(files, output_dir, scope='all', nested=True, deduplicate=True, tolerance=0.1,
+              rules=(), progress=None, stop=None):
+    """Shared CLI/UI worker. Callbacks must not directly access GUI widgets."""
+    if not math.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError('位置容差必须大于零')
+    paths = list(dict.fromkeys(Path(f).expanduser().resolve() for f in files))
+    rows, statuses, dedup, overlap_rows = [], [], [], []
+    completed = 0
+    def emit(stage, **info):
+        if progress:
+            progress({'stage': stage, 'completed': completed, 'total': len(paths), **info})
+    for path in paths:
+        if stop is not None and stop.is_set():
+            break
+        emit('file_start', file=str(path))
+        status = '成功'
+        try:
+            doc = load_drawing(path)
+            emit('counting', file=str(path))
+            items, notices = count_blocks(doc, path, scope, nested)
+            rows.extend(items)
+            if deduplicate:
+                emit('deduplicating', file=str(path))
+                try:
+                    clean, positions, issues = analyze(doc, path, scope, nested, tolerance, rules)
+                    dedup.extend(clean)
+                    overlap_rows.extend(positions)
+                    notices = sorted(set(notices + issues))
+                except Exception as exc:
+                    notices.append('去重分析失败，仅保留基础计数：' + str(exc))
+            if notices:
+                status = '警告'
+                statuses.extend([[str(path), status, n] for n in notices])
+            else:
+                statuses.append([str(path), status, '已统计' if items else '未发现 INSERT 块引用（数量为零）'])
+        except Exception as exc:
+            status = '失败'
+            statuses.append([str(path), status, str(exc)])
+        completed += 1
+        emit('file_done', file=str(path), status=status,
+             messages=[r[2] for r in statuses if r[0] == str(path)])
+    cancelled = completed < len(paths)
+    reports = ()
+    if completed:
+        if cancelled:
+            statuses.append(['本次任务', '已停止', f'仅处理 {completed}/{len(paths)} 份图纸，未处理图纸不计入结果'])
+        emit('exporting')
+        reports = export_reports(rows, statuses, Path(output_dir), scope, nested,
+                                 dedup if deduplicate else None, overlap_rows, tolerance)
+    return {'reports': reports, 'completed': completed, 'total': len(paths), 'cancelled': cancelled,
+            'failed': len({r[0] for r in statuses if r[1] == '失败'}),
+            'warnings': len({r[0] for r in statuses if r[1] == '警告'})}
+
+
 def main():
     parser = argparse.ArgumentParser(description='只读统计 CAD 块数量，导出 Excel 和 CSV；无需 AutoCAD')
     parser.add_argument('files', nargs='*')
@@ -187,38 +241,15 @@ def main():
         if not args.files:
             return 0
     configure_oda(args.oda_path)
-    rows, statuses = [], []
-    dedup, overlap_rows = [], []
-    seen = set()
-    for filename in args.files:
-        path = Path(filename).expanduser().resolve()
-        if path in seen:
-            continue
-        seen.add(path)
-        print(f'统计：{path.name}', flush=True)
-        try:
-            doc = load_drawing(path)
-            items, notices = count_blocks(doc, path, args.scope, not args.no_nested)
-            rows.extend(items)
-            if not args.no_dedup:
-                try:
-                    clean, positions, issues = analyze(doc, path, args.scope, not args.no_nested, args.tolerance, rules)
-                    dedup.extend(clean)
-                    overlap_rows.extend(positions)
-                    notices = sorted(set(notices + issues))
-                except Exception as exc:
-                    notices.append('去重分析失败，仅保留基础计数：' + str(exc))
-            if notices:
-                statuses.extend([[str(path), '警告', n] for n in notices])
-            else:
-                statuses.append([str(path), '成功', '已统计' if items else '未发现 INSERT 块引用（数量为零）'])
-        except Exception as exc:
-            statuses.append([str(path), '失败', str(exc)])
     output_dir = args.output_dir or Path(args.files[0]).resolve().parent / '块统计结果'
-    for path in export_reports(rows, statuses, output_dir, args.scope, not args.no_nested,
-                               None if args.no_dedup else dedup, overlap_rows, args.tolerance):
+    def progress(event):
+        if event['stage'] == 'file_start':
+            print('统计：', event['file'], flush=True)
+    result = run_batch(args.files, output_dir, args.scope, not args.no_nested,
+                       not args.no_dedup, args.tolerance, rules, progress)
+    for path in result['reports']:
         print('已生成：', path)
-    return 1 if any(row[1] == '失败' for row in statuses) else 0
+    return 1 if result['failed'] else 0
 
 
 if __name__ == '__main__':
