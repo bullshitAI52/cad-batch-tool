@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import sys
 import uuid
+import math
+from overlap import analyze, load_rules, SUMMARY_HEADERS, DETAIL_HEADERS
 
 import ezdxf
 from ezdxf.addons import odafc
@@ -130,7 +132,7 @@ def write_sheet(ws, headers, rows, note, widths):
     ws.auto_filter.ref = f'A2:{get_column_letter(len(headers))}{max(2,ws.max_row)}'
 
 
-def export_reports(rows, statuses, output_dir, scope, nested):
+def export_reports(rows, statuses, output_dir, scope, nested, dedup=None, overlap_rows=None, tolerance=0.1):
     output_dir.mkdir(parents=True, exist_ok=True)
     base = output_dir / ('块数量统计_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:8])
     xlsx, csv_path, status_csv = [Path(str(base) + ext) for ext in ('.xlsx', '.csv', '_处理记录.csv')]
@@ -141,13 +143,24 @@ def export_reports(rows, statuses, output_dir, scope, nested):
     write_sheet(detail, HEADERS, rows, note, [46, 22, 24, 32, 24, 16, 16])
     write_sheet(wb.create_sheet('处理记录'), STATUS_HEADERS, statuses,
                 '检查失败及警告：失败图纸不计入统计；警告可能表示统计不完整。', [55, 18, 95])
+    extra = []
+    if dedup is not None:
+        summary = wb.create_sheet('分类去重统计', 0)
+        write_sheet(summary, SUMMARY_HEADERS, dedup,
+                    f'分类为规则匹配，需核对。只扣完全重复；疑似不扣。位置容差={tolerance} 图纸单位。直接与嵌套不可跨块名盲目相加。',
+                    [46,20,24,24,30,16,16,16,16,18,18,18])
+        write_sheet(wb.create_sheet('重复位置明细'), DETAIL_HEADERS, overlap_rows or [],
+                    '位置为块基点的世界坐标；对象路径含父级句柄及阵列序号。疑似组按相邻关系连通，组内两端距离可能超过容差。',
+                    [46,16,18,20,24,24,28,14,45,20,20,20,16,70])
+        extra = [(Path(str(base)+'_去重统计.csv'),SUMMARY_HEADERS,dedup),
+                 (Path(str(base)+'_重复明细.csv'),DETAIL_HEADERS,overlap_rows or [])]
     wb.save(xlsx)
-    for path, headers, content in [(csv_path, HEADERS, rows), (status_csv, STATUS_HEADERS, statuses)]:
+    for path, headers, content in [(csv_path, HEADERS, rows), (status_csv, STATUS_HEADERS, statuses)] + extra:
         with path.open('w', encoding='utf-8-sig', newline='') as stream:
             writer = csv.writer(stream)
             writer.writerow(headers)
             writer.writerows([safe_csv(v) for v in row] for row in content)
-    return xlsx, csv_path, status_csv
+    return (xlsx, csv_path, status_csv, *(item[0] for item in extra))
 
 
 def main():
@@ -157,7 +170,13 @@ def main():
     parser.add_argument('--oda-path', default=os.environ.get('ODA_FILE_CONVERTER'))
     parser.add_argument('--scope', choices=['all', 'model'], default='all')
     parser.add_argument('--no-nested', action='store_true')
+    parser.add_argument('--no-dedup', action='store_true', help='仅运行基础计数')
+    parser.add_argument('--tolerance', type=float, default=0.1, help='疑似重叠位置容差，单位与图纸坐标相同')
+    parser.add_argument('--rules', type=Path, default=Path(__file__).with_name('classification.json'))
     args = parser.parse_args()
+    if not math.isfinite(args.tolerance) or args.tolerance<=0:
+        parser.error('--tolerance 必须为大于零的有限数值')
+    rules = load_rules(args.rules) if not args.no_dedup else []
     if not args.files:
         import tkinter as tk
         from tkinter.filedialog import askopenfilenames
@@ -169,6 +188,7 @@ def main():
             return 0
     configure_oda(args.oda_path)
     rows, statuses = [], []
+    dedup, overlap_rows = [], []
     seen = set()
     for filename in args.files:
         path = Path(filename).expanduser().resolve()
@@ -180,6 +200,14 @@ def main():
             doc = load_drawing(path)
             items, notices = count_blocks(doc, path, args.scope, not args.no_nested)
             rows.extend(items)
+            if not args.no_dedup:
+                try:
+                    clean, positions, issues = analyze(doc, path, args.scope, not args.no_nested, args.tolerance, rules)
+                    dedup.extend(clean)
+                    overlap_rows.extend(positions)
+                    notices = sorted(set(notices + issues))
+                except Exception as exc:
+                    notices.append('去重分析失败，仅保留基础计数：' + str(exc))
             if notices:
                 statuses.extend([[str(path), '警告', n] for n in notices])
             else:
@@ -187,7 +215,8 @@ def main():
         except Exception as exc:
             statuses.append([str(path), '失败', str(exc)])
     output_dir = args.output_dir or Path(args.files[0]).resolve().parent / '块统计结果'
-    for path in export_reports(rows, statuses, output_dir, args.scope, not args.no_nested):
+    for path in export_reports(rows, statuses, output_dir, args.scope, not args.no_nested,
+                               None if args.no_dedup else dedup, overlap_rows, args.tolerance):
         print('已生成：', path)
     return 1 if any(row[1] == '失败' for row in statuses) else 0
 

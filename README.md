@@ -1,6 +1,6 @@
 # CAD 图纸批处理工具
 
-新增 [独立块数量统计工具](block-counter/README.md)：不启动 AutoCAD，批量读取 DWG/DXF，按文件、布局、图层、块名统计直接与嵌套数量，导出 Excel 和 CSV；原图只读。DWG 需要 ODA 转换器。下载仓库后进入 `block-counter`，先运行 `Setup.cmd`，再运行 `Count-Blocks.cmd`。
+新增 [独立块数量统计工具](block-counter/README.md)：不启动 AutoCAD，批量读取 DWG/DXF，按文件、布局、图层、块名统计直接与嵌套数量，支持分类配置、确认重叠去重、疑似重复和位置明细，导出 Excel 和 CSV；原图只读。DWG 需要 ODA 转换器。下载仓库后进入 `block-counter`，先运行 `Setup.cmd`，再运行 `Count-Blocks.cmd`。分类按关键词规则，不能代替真实设备识别；去重为保守判断，真实 DWG 仍需样图验证。
 
 新增 [ezdxf + ODA 转换器版本](oda-version/README.md)：无需 AutoCAD，通过 DXF 中间格式处理后输出 DWG。与下述 Core Console 版本独立，依赖和兼容性限制见对应说明。
 
