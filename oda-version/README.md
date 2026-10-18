@@ -1,5 +1,7 @@
 # ezdxf + ODA 版本（实验版）
 
+后续功能规划见仓库首页的 [开发计划](../README.md#后续开发计划不启动-autocad-的批处理工具)，其中未勾选项目均为待开发功能。
+
 流程：DWG → ODA 转 DXF → ezdxf 整理 → ODA 转 DWG 2004。无需安装或启动 AutoCAD，但需要 Python 3.10+ 和 ODA File Converter。不是纯 Python 原生读取 DWG，也不保证比 Core Console 快。
 
 ## Windows 使用
