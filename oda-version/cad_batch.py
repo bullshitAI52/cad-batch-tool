@@ -9,6 +9,83 @@ import uuid
 
 import ezdxf
 from ezdxf.addons import odafc
+from ezdxf import blkrefs
+from ezdxf.entities import DXFTagStorage
+from ezdxf.lldxf.tagwriter import TagCollector
+
+
+def conservative_purge(doc):
+    """Fail closed for opaque data; only remove provably unused ordinary resources."""
+    report = {'removed_blocks': [], 'removed_layers': [], 'retained_blocks': [],
+              'retained_layers': [], 'warnings': []}
+    def retained():
+        report['retained_blocks'] = [b.name for b in doc.blocks]
+        report['retained_layers'] = [layer.dxf.name for layer in doc.layers]
+        return report
+
+    for entity in doc.entitydb.values():
+        if not entity.is_alive:
+            continue
+        if (isinstance(entity, DXFTagStorage) or entity.dxftype().startswith('ACAD_PROXY')
+                or entity.xdata or entity.appdata or entity.has_extension_dict):
+            report['warnings'].append('Cleanup skipped: custom, proxy or extended data may contain hidden references.')
+            return retained()
+
+    def references(kind):
+        values = set()
+        header_tags = TagCollector(dxfversion=doc.dxfversion)
+        doc.header.export_dxf(header_tags)
+        for tag in header_tags.tags:
+            value = tag.value
+            if isinstance(value, str):
+                values.add(value.casefold())
+        for entity in doc.entitydb.values():
+            if not entity.is_alive:
+                continue
+            for tag in TagCollector.dxftags(entity, dxfversion=doc.dxfversion):
+                # Exclude only a resource's own identifier, not its pointers.
+                if kind == 'block' and entity.dxftype() in ('BLOCK', 'BLOCK_RECORD') and tag.code in (2, 3, 5):
+                    continue
+                if kind == 'layer' and entity.dxftype() == 'LAYER' and tag.code in (2, 5):
+                    continue
+                if isinstance(tag.value, str):
+                    values.add(tag.value.casefold())
+        return values
+
+    try:
+        # Recompute after each round: removing an unused parent can free its children.
+        for _ in range(len(doc.blocks) + 1):
+            refs = references('block')
+            candidates = blkrefs.find_unreferenced_blocks(doc)
+            removed = False
+            for name in sorted(candidates):
+                block = doc.blocks.get(name)
+                if (block is None or name.startswith('*') or '|' in name
+                        or block.block.dxf.flags & 12
+                        or name.casefold() in refs):
+                    continue
+                try:
+                    doc.blocks.delete_block(name, safe=True)
+                except ezdxf.DXFBlockInUseError:
+                    continue
+                report['removed_blocks'].append(name)
+                removed = True
+            if not removed:
+                break
+        refs = references('layer')
+        for layer in list(doc.layers):
+            name = layer.dxf.name
+            if (name.casefold() in ('0', 'defpoints') or '|' in name
+                    or layer.dxf.flags & 16 or layer.is_locked()
+                    or layer.is_frozen() or layer.is_off()
+                    or name.casefold() in refs or layer.dxf.handle.casefold() in refs):
+                continue
+            doc.layers.remove(name)
+            report['removed_layers'].append(name)
+    except Exception as exc:
+        # Do not save partial cleanup when reference analysis fails.
+        raise RuntimeError(f'Cleanup reference analysis failed; output not saved: {exc}') from exc
+    return retained()
 
 
 def locked(doc, entity):
@@ -112,6 +189,10 @@ def process(source, args):
         print(f'Reading {source.name}', flush=True)
         doc = ezdxf.readfile(source) if source.suffix.lower() == '.dxf' else odafc.readfile(source, version='R2018', audit=False)
         details['processing'] = transform(doc, args.passes, not args.keep_layers)
+        if not getattr(args, 'no_purge', False):
+            details['cleanup'] = conservative_purge(doc)
+        else:
+            details['cleanup'] = {'disabled': True}
         if output.exists():
             raise FileExistsError('Output exists; refusing overwrite')
         print('Saving output...', flush=True)
@@ -140,6 +221,7 @@ def main():
     parser.add_argument('--oda-path', default=os.environ.get('ODA_FILE_CONVERTER'))
     parser.add_argument('--passes', type=int, choices=range(1, 21), default=4)
     parser.add_argument('--keep-layers', action='store_true', help='Preserve entity layer assignments')
+    parser.add_argument('--no-purge', action='store_true', help='Disable conservative unused block/layer cleanup')
     parser.add_argument('--dxf-only', action='store_true', help='Write DXF instead of DWG; for testing')
     args = parser.parse_args()
     configure_oda(args.oda_path)

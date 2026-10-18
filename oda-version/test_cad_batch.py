@@ -4,10 +4,54 @@ from pathlib import Path
 import tempfile
 import unittest
 import ezdxf
-from cad_batch import transform, process
+from cad_batch import transform, process, conservative_purge
 
 
 class ProcessingTests(unittest.TestCase):
+    def test_purge_unused_nested_resources(self):
+        doc = ezdxf.new('R2018')
+        doc.layers.new('Unused')
+        child = doc.blocks.new('UnusedChild')
+        child.add_line((0, 0), (1, 1), dxfattribs={'layer': 'Unused'})
+        parent = doc.blocks.new('UnusedParent')
+        parent.add_blockref('UnusedChild', (0, 0))
+        doc.layers.new('Live')
+        live = doc.blocks.new('LiveBlock')
+        live.add_line((0, 0), (1, 1), dxfattribs={'layer': 'Live'})
+        doc.modelspace().add_blockref('LiveBlock', (0, 0))
+        report = conservative_purge(doc)
+        self.assertEqual(set(report['removed_blocks']), {'UnusedParent', 'UnusedChild'})
+        self.assertIn('Unused', report['removed_layers'])
+        self.assertIn('Live', doc.layers)
+        self.assertIn('LiveBlock', doc.blocks)
+        self.assertFalse(doc.audit().has_errors)
+
+    def test_purge_retains_header_handle_and_layout_refs(self):
+        doc = ezdxf.new('R2018')
+        for name in ('Current', 'Locked', 'ByHandle', 'Paper', 'Empty'):
+            doc.layers.new(name)
+        doc.header['$CLAYER'] = 'Current'
+        doc.layers.get('Locked').lock()
+        doc.layouts.new('Sheet').add_circle((0, 0), 1, dxfattribs={'layer': 'Paper'})
+        record = doc.rootdict.add_xrecord('TEST_REFERENCE')
+        record.reset([(330, doc.layers.get('ByHandle').dxf.handle)])
+        report = conservative_purge(doc)
+        self.assertIn('Empty', report['removed_layers'])
+        for name in ('Current', 'Locked', 'ByHandle', 'Paper', '0', 'Defpoints'):
+            self.assertIn(name, doc.layers)
+
+    def test_custom_data_disables_cleanup(self):
+        doc = ezdxf.new()
+        doc.layers.new('Empty')
+        doc.blocks.new('EmptyBlock')
+        doc.appids.new('CUSTOM')
+        entity = doc.modelspace().add_point((0, 0))
+        entity.set_xdata('CUSTOM', [(1000, 'EmptyBlock')])
+        report = conservative_purge(doc)
+        self.assertTrue(report['warnings'])
+        self.assertEqual(report['removed_blocks'], [])
+        self.assertIn('Empty', doc.layers)
+
     def test_nested_blocks_and_layout(self):
         doc = ezdxf.new('R2018')
         doc.layers.new('A')
