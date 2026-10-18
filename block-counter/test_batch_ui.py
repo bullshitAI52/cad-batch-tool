@@ -12,6 +12,28 @@ import tkinter as tk
 
 
 class BatchTests(unittest.TestCase):
+    def test_small_window_large_font_scrolls(self):
+        try:root=tk.Tk()
+        except tk.TclError as exc:self.skipTest(str(exc))
+        try:
+            app=App(root)
+            root.geometry('480x360')
+            root.update()
+            app.font_size.set('24');app.apply_font_size()
+            root.update()
+            self.assertEqual(app.ui_fonts[0].actual('size'),24)
+            self.assertEqual(app.title_font.actual('size'),32)
+            region=list(map(float,app.canvas['scrollregion'].split()))
+            self.assertGreater(region[2],app.canvas.winfo_width())
+            self.assertGreater(region[3],app.canvas.winfo_height())
+            app.canvas.yview_moveto(1);app.canvas.xview_moveto(1)
+            root.update()
+            self.assertGreater(app.canvas.yview()[0],0)
+            self.assertGreater(app.canvas.xview()[0],0)
+            app.font_size.set('10');app.apply_font_size();root.update()
+            self.assertEqual(app.ui_fonts[0].actual('size'),10)
+        finally:root.destroy()
+
     def test_folder_scan_and_stop_exports_partial(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td)

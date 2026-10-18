@@ -8,11 +8,25 @@ import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 from tkinter.scrolledtext import ScrolledText
 
 from block_count import configure_oda, run_batch
 from overlap import load_rules
 from ezdxf.addons import odafc
+
+
+def enable_high_dpi():
+    """Request system DPI awareness before Tk creates Windows windows."""
+    if sys.platform == 'win32':
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except (AttributeError, OSError):
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except (AttributeError, OSError):
+                pass
 
 
 def discover_files(folder, recursive):
@@ -28,8 +42,32 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title('CAD 块数量统计 · 分类与重叠检查')
-        root.geometry('930x760')
-        root.minsize(780,660)
+        root.geometry(f'{min(930, root.winfo_screenwidth()-60)}x{min(760, root.winfo_screenheight()-100)}')
+        root.minsize(420,320)
+        self.ui_fonts = [tkfont.nametofont(name, root=root) for name in
+                         ('TkDefaultFont', 'TkTextFont', 'TkMenuFont', 'TkHeadingFont')]
+        initial_size = abs(self.ui_fonts[0].actual('size')) or 12
+        self.font_size = tk.StringVar(value=str(max(9, min(24, initial_size))))
+        self.title_font = self.ui_fonts[0].copy()
+        toolbar = ttk.Frame(root, padding=(12, 6))
+        toolbar.pack(fill='x')
+        ttk.Label(toolbar, text='字体大小').pack(side='left')
+        font_choice = ttk.Combobox(toolbar, width=4, state='readonly',
+                                  textvariable=self.font_size, values=list(range(9,25)))
+        font_choice.pack(side='left', padx=8)
+        font_choice.bind('<<ComboboxSelected>>', self.apply_font_size)
+        ttk.Label(toolbar, text='小窗口可滚动查看').pack(side='left')
+        viewport = ttk.Frame(root)
+        viewport.pack(fill='both', expand=True)
+        viewport.rowconfigure(0, weight=1)
+        viewport.columnconfigure(0, weight=1)
+        self.canvas = tk.Canvas(viewport, highlightthickness=0)
+        self.canvas.grid(row=0,column=0,sticky='nsew')
+        vertical = ttk.Scrollbar(viewport, orient='vertical', command=self.canvas.yview)
+        vertical.grid(row=0,column=1,sticky='ns')
+        horizontal = ttk.Scrollbar(viewport, orient='horizontal', command=self.canvas.xview)
+        horizontal.grid(row=1,column=0,sticky='ew')
+        self.canvas.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
         self.events = queue.Queue()
         self.stop = threading.Event()
         self.running = False
@@ -45,10 +83,15 @@ class App:
         self.tolerance = tk.StringVar(value='0.1')
         self.status = tk.StringVar(value='选择图纸文件夹和结果文件夹后，点击开始统计。')
         self.amount = tk.StringVar(value='尚未开始')
-        outer = ttk.Frame(root, padding=20)
-        outer.pack(fill='both', expand=True)
+        outer = self.outer = ttk.Frame(self.canvas, padding=20)
+        self.page = self.canvas.create_window(0,0,window=outer,anchor='nw')
+        outer.bind('<Configure>', self.resize_page)
+        self.canvas.bind('<Configure>', self.resize_page)
+        root.bind('<MouseWheel>', self.scroll_page, add='+')
+        root.bind('<Button-4>', self.scroll_page, add='+')
+        root.bind('<Button-5>', self.scroll_page, add='+')
         outer.columnconfigure(1, weight=1)
-        ttk.Label(outer, text='CAD 块数量统计', font=('',20,'bold')).grid(row=0,column=0,columnspan=3,sticky='w',pady=(0,5))
+        ttk.Label(outer, text='CAD 块数量统计', font=self.title_font).grid(row=0,column=0,columnspan=3,sticky='w',pady=(0,5))
         ttk.Label(outer,text='不启动 AutoCAD · 原图只读 · 导出 Excel 与 CSV').grid(row=1,column=0,columnspan=3,sticky='w',pady=(0,18))
         self.path_row(outer,2,'CAD 文件夹',self.source,'source')
         self.path_row(outer,3,'结果文件夹',self.destination,'destination')
@@ -79,11 +122,40 @@ class App:
         self.bar=ttk.Progressbar(outer,maximum=100,mode='determinate')
         self.bar.grid(row=9,column=0,columnspan=3,sticky='ew',pady=8)
         ttk.Label(outer,textvariable=self.amount).grid(row=10,column=0,columnspan=3,sticky='w')
-        self.log=ScrolledText(outer,height=12,wrap='word',state='disabled')
+        self.log=ScrolledText(outer,height=12,width=40,wrap='word',state='disabled',font='TkTextFont')
         self.log.grid(row=11,column=0,columnspan=3,sticky='nsew',pady=(10,0))
         outer.rowconfigure(11,weight=1)
+        self.apply_font_size()
         root.protocol('WM_DELETE_WINDOW',self.close)
         root.after(100,self.poll)
+
+    def apply_font_size(self, event=None):
+        size = int(self.font_size.get())
+        for font in self.ui_fonts:
+            font.configure(size=size)
+        self.title_font.configure(size=size+8, weight='bold')
+        self.root.option_add('*TCombobox*Listbox.font', 'TkTextFont')
+        self.root.after_idle(self.resize_page)
+
+    def resize_page(self, event=None):
+        width = max(self.canvas.winfo_width(), self.outer.winfo_reqwidth())
+        height = max(self.canvas.winfo_height(), self.outer.winfo_reqheight())
+        self.canvas.itemconfigure(self.page,width=width,height=height)
+        self.canvas.configure(scrollregion=(0,0,width,height))
+
+    def scroll_page(self, event):
+        # Text widgets retain native scrolling; a combobox retains selection.
+        if isinstance(event.widget, (tk.Text, ttk.Combobox)):
+            return
+        if getattr(event,'num',None) in (4,5):
+            step = -1 if event.num == 4 else 1
+        else:
+            delta = event.delta
+            step = -int(delta) if sys.platform == 'darwin' else -int(delta/120)
+            if not step and delta:
+                step = -1 if delta > 0 else 1
+        self.canvas.yview_scroll(step,'units')
+        return 'break'
 
     def path_row(self,parent,row,label,var,kind):
         ttk.Label(parent,text=label).grid(row=row,column=0,sticky='w',padx=(0,12),pady=5)
@@ -204,4 +276,5 @@ class App:
 
 
 if __name__=='__main__':
+    enable_high_dpi()
     app_root=tk.Tk();App(app_root);app_root.mainloop()
