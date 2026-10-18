@@ -4,3 +4,6 @@
 *.dwl2
 *.log
 .DS_Store
+.venv/
+__pycache__/
+*.pyc

@@ -1,5 +1,7 @@
 # CAD 图纸批处理工具
 
+新增 [ezdxf + ODA 转换器版本](oda-version/README.md)：无需 AutoCAD，通过 DXF 中间格式处理后输出 DWG。与下述 Core Console 版本独立，依赖和兼容性限制见对应说明。
+
 用于 Windows AutoCAD 的 DWG 批处理脚本：先复制原图，再进行有限轮次炸开、图层整理、清理未使用定义，并输出 AutoCAD 2004 格式副本。
 
 **当前为未经过真实 AutoCAD 转换验证的初版。仅完成静态检查，请先用样图测试，不要直接用于正式交付。**
